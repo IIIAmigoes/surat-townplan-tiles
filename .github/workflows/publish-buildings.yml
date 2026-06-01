@@ -96,7 +96,7 @@ jobs:
             echo '{"type":"FeatureCollection","features":['
             first=true
             while IFS= read -r row; do
-              geom=$(echo "$row" | jq -rc '.geometry_json | fromjson')
+              geom=$(echo "$row" | jq -rc '.geometry_json')
               props=$(echo "$row" | jq -rc '{height: .height, num_floors: .num_floors, class: .class}')
               id=$(echo "$row" | jq -rc '.id')
               feature="{\"type\":\"Feature\",\"id\":$id,\"geometry\":$geom,\"properties\":$props}"
