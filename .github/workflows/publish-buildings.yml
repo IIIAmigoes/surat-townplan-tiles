@@ -1,0 +1,176 @@
+name: Build & publish buildings PMTiles
+
+# Self-contained pipeline: extract Surat building footprints from Overture Maps,
+# convert to PMTiles, and publish to GitHub Pages.
+#
+# Hosting design (COD-132): GitHub Pages serves the .pmtiles with
+#   Access-Control-Allow-Origin: *  and  Accept-Ranges: bytes
+# which is exactly what the PMTiles client needs (CORS + HTTP range requests).
+# No external account, no secrets, no billing. Public URL is stable:
+#   https://iiiamigoes.github.io/surat-townplan-tiles/buildings-surat.pmtiles
+#
+# The build steps are a verbatim port of the E2E-verified pipeline from
+# IIIAmigoes/surat-townplan refresh-buildings.yml; only the final publish
+# target changed (Cloudflare R2 -> GitHub Pages). The build needs NO secrets:
+# Overture Maps is a public S3 dataset.
+
+on:
+  workflow_dispatch:
+    inputs:
+      overture_release:
+        description: "Overture Maps release tag"
+        required: false
+        default: "2026-05-20.0"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/publish-buildings.yml"
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          # DuckDB
+          DUCKDB_VERSION=1.2.2
+          curl -fsSL "https://github.com/duckdb/duckdb/releases/download/v${DUCKDB_VERSION}/duckdb_cli-linux-amd64.zip" \
+            -o /tmp/duckdb.zip
+          sudo unzip -o /tmp/duckdb.zip duckdb -d /usr/local/bin
+          duckdb --version
+
+          # tippecanoe
+          sudo apt-get install -y --no-install-recommends tippecanoe jq
+
+          # verify
+          tippecanoe --version
+          jq --version
+
+      - name: Extract buildings from Overture Maps
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/surat-buildings
+          RELEASE="${{ github.event.inputs.overture_release || '2026-05-20.0' }}"
+          duckdb -c "
+          INSTALL spatial;
+          INSTALL httpfs;
+          LOAD spatial;
+          LOAD httpfs;
+          SET s3_region = 'us-west-2';
+          SET s3_use_ssl = true;
+
+          COPY (
+            SELECT
+              id,
+              ST_AsGeoJSON(geometry) AS geometry_json,
+              COALESCE(height, 0)::DOUBLE       AS height,
+              COALESCE(num_floors, 0)::INTEGER  AS num_floors,
+              COALESCE(class, '')               AS class
+            FROM read_parquet(
+              's3://overturemaps-us-west-2/release/${RELEASE}/theme=buildings/type=building/*',
+              hive_partitioning = 1,
+              filename = false
+            )
+            WHERE bbox.xmin >= 72.65 AND bbox.xmax <= 72.95
+              AND bbox.ymin >= 21.08 AND bbox.ymax <= 21.30
+          ) TO '/tmp/surat-buildings/buildings-raw.ndjson' (FORMAT JSON, ARRAY false);
+          "
+          echo "Extracted $(wc -l < /tmp/surat-buildings/buildings-raw.ndjson) buildings"
+
+      - name: Convert to GeoJSON FeatureCollection
+        run: |
+          set -euo pipefail
+          cd /tmp/surat-buildings
+          {
+            echo '{"type":"FeatureCollection","features":['
+            first=true
+            while IFS= read -r row; do
+              geom=$(echo "$row" | jq -rc '.geometry_json | fromjson')
+              props=$(echo "$row" | jq -rc '{height: .height, num_floors: .num_floors, class: .class}')
+              id=$(echo "$row" | jq -rc '.id')
+              feature="{\"type\":\"Feature\",\"id\":$id,\"geometry\":$geom,\"properties\":$props}"
+              if $first; then
+                echo "$feature"
+                first=false
+              else
+                echo ",$feature"
+              fi
+            done < buildings-raw.ndjson
+            echo ']}'
+          } > buildings-surat.geojson
+          echo "Features: $(grep -c '"type":"Feature"' buildings-surat.geojson)"
+
+      - name: Generate PMTiles via tippecanoe
+        run: |
+          set -euo pipefail
+          tippecanoe \
+            --output=/tmp/surat-buildings/buildings-surat.pmtiles \
+            --layer=buildings \
+            --minimum-zoom=12 \
+            --maximum-zoom=18 \
+            --drop-densest-as-needed \
+            --extend-zooms-if-still-dropping \
+            --simplification=4 \
+            --force \
+            /tmp/surat-buildings/buildings-surat.geojson
+          du -sh /tmp/surat-buildings/buildings-surat.pmtiles
+
+      - name: Stage Pages artifact
+        run: |
+          set -euo pipefail
+          mkdir -p _site
+          cp /tmp/surat-buildings/buildings-surat.pmtiles _site/buildings-surat.pmtiles
+          SIZE_MB=$(( $(stat -c%s _site/buildings-surat.pmtiles) / 1024 / 1024 ))
+          cat > _site/index.html <<HTML
+          <!doctype html><meta charset="utf-8">
+          <title>Surat town-planning tiles</title>
+          <h1>Surat town-planning PMTiles</h1>
+          <ul>
+            <li><a href="./buildings-surat.pmtiles">buildings-surat.pmtiles</a> (${SIZE_MB} MB)</li>
+          </ul>
+          <p>Overture-derived building footprints. Served with CORS + HTTP range.</p>
+          HTML
+          echo "Staged buildings-surat.pmtiles (${SIZE_MB} MB)"
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Buildings PMTiles publish"
+            echo
+            if [[ -f _site/buildings-surat.pmtiles ]]; then
+              SIZE_MB=$(( $(stat -c%s _site/buildings-surat.pmtiles) / 1024 / 1024 ))
+              echo "- output: \`buildings-surat.pmtiles\` (${SIZE_MB} MB)"
+              echo "- public URL: https://iiiamigoes.github.io/surat-townplan-tiles/buildings-surat.pmtiles"
+              echo "- release: ${{ github.event.inputs.overture_release || '2026-05-20.0' }}"
+            else
+              echo "- output: missing"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
